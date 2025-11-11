@@ -1,0 +1,377 @@
+import * as THREE from "three";
+import { GLTF } from "three-stdlib";
+import { eyebrowBoneNames, typingBoneNames } from "../../../data/boneData";
+
+const setAnimations = (gltf: GLTF) => {
+  let character = gltf.scene;
+  let mixer = new THREE.AnimationMixer(character);
+  if (gltf.animations) {
+    const introClip = gltf.animations.find(
+      (clip) => clip.name === "introAnimation"
+    );
+    const introAction = mixer.clipAction(introClip!);
+    introAction.setLoop(THREE.LoopOnce, 1);
+    introAction.clampWhenFinished = true;
+    introAction.play();
+    const clipNames = ["key1", "key2", "key5", "key6"];
+    clipNames.forEach((name) => {
+      const clip = THREE.AnimationClip.findByName(gltf.animations, name);
+      if (clip) {
+        const action = mixer?.clipAction(clip);
+        action!.play();
+        action!.timeScale = 1.2;
+      } else {
+        console.error(`Animation "${name}" not found`);
+      }
+    });
+    let typingAction: THREE.AnimationAction | null = null;
+    typingAction = createBoneAction(gltf, mixer, "typing", typingBoneNames);
+    if (typingAction) {
+      typingAction.enabled = true;
+      typingAction.play();
+      typingAction.timeScale = 1.2;
+    }
+  }
+  function startIntro() {
+    const introClip = gltf.animations.find(
+      (clip) => clip.name === "introAnimation"
+    );
+    const introAction = mixer.clipAction(introClip!);
+    introAction.clampWhenFinished = true;
+    introAction.reset().play();
+    setTimeout(() => {
+      const blink = gltf.animations.find((clip) => clip.name === "Blink");
+      mixer.clipAction(blink!).play().fadeIn(0.5);
+    }, 2500);
+  }
+  function hover(gltf: GLTF, hoverDiv: HTMLDivElement) {
+    let eyeBrowUpAction = createBoneAction(
+      gltf,
+      mixer,
+      "browup",
+      eyebrowBoneNames
+    );
+    let isHovering = false;
+    if (eyeBrowUpAction) {
+      eyeBrowUpAction.setLoop(THREE.LoopOnce, 1);
+      eyeBrowUpAction.clampWhenFinished = true;
+      eyeBrowUpAction.enabled = true;
+    }
+    const onHoverFace = () => {
+      if (eyeBrowUpAction && !isHovering) {
+        isHovering = true;
+        eyeBrowUpAction.reset();
+        eyeBrowUpAction.enabled = true;
+        eyeBrowUpAction.setEffectiveWeight(4);
+        eyeBrowUpAction.fadeIn(0.5).play();
+      }
+    };
+    const onLeaveFace = () => {
+      if (eyeBrowUpAction && isHovering) {
+        isHovering = false;
+        eyeBrowUpAction.fadeOut(0.6);
+      }
+    };
+    if (!hoverDiv) return;
+    hoverDiv.addEventListener("mouseenter", onHoverFace);
+    hoverDiv.addEventListener("mouseleave", onLeaveFace);
+    return () => {
+      hoverDiv.removeEventListener("mouseenter", onHoverFace);
+      hoverDiv.removeEventListener("mouseleave", onLeaveFace);
+    };
+  }
+  return { mixer, startIntro, hover };
+};
+
+const createBoneAction = (
+  gltf: GLTF,
+  mixer: THREE.AnimationMixer,
+  clip: string,
+  boneNames: string[]
+): THREE.AnimationAction | null => {
+  const AnimationClip = THREE.AnimationClip.findByName(gltf.animations, clip);
+  if (!AnimationClip) {
+    console.error(`Animation "${clip}" not found in GLTF file.`);
+    return null;
+  }
+
+  const filteredClip = filterAnimationTracks(AnimationClip, boneNames);
+
+  return mixer.clipAction(filteredClip);
+};
+
+const filterAnimationTracks = (
+  clip: THREE.AnimationClip,
+  boneNames: string[]
+): THREE.AnimationClip => {
+  const filteredTracks = clip.tracks.filter((track) =>
+    boneNames.some((boneName) => track.name.includes(boneName))
+  );
+
+  return new THREE.AnimationClip(
+    clip.name + "_filtered",
+    clip.duration,
+    filteredTracks
+  );
+};
+
+export default setAnimations;
+
+import * as THREE from "three";
+import { DRACOLoader, GLTF, GLTFLoader } from "three-stdlib";
+import { setCharTimeline, setAllTimeline } from "../../utils/GsapScroll";
+import { decryptFile } from "./decrypt";
+
+const setCharacter = (
+  renderer: THREE.WebGLRenderer,
+  scene: THREE.Scene,
+  camera: THREE.PerspectiveCamera
+) => {
+  const loader = new GLTFLoader();
+  const dracoLoader = new DRACOLoader();
+  dracoLoader.setDecoderPath("/draco/");
+  loader.setDRACOLoader(dracoLoader);
+
+  const loadCharacter = () => {
+    return new Promise<GLTF | null>(async (resolve, reject) => {
+      try {
+        const encryptedBlob = await decryptFile(
+          "/models/character.enc",
+          "Character3D#@"
+        );
+        const blobUrl = URL.createObjectURL(new Blob([encryptedBlob]));
+
+        let character: THREE.Object3D;
+        loader.load(
+          blobUrl,
+          async (gltf) => {
+            character = gltf.scene;
+            await renderer.compileAsync(character, camera, scene);
+            character.traverse((child: any) => {
+              if (child.isMesh) {
+                const mesh = child as THREE.Mesh;
+                child.castShadow = true;
+                child.receiveShadow = true;
+                mesh.frustumCulled = true;
+              }
+            });
+            resolve(gltf);
+            setCharTimeline(character, camera);
+            setAllTimeline();
+            character!.getObjectByName("footR")!.position.y = 3.36;
+            character!.getObjectByName("footL")!.position.y = 3.36;
+            dracoLoader.dispose();
+          },
+          undefined,
+          (error) => {
+            console.error("Error loading GLTF model:", error);
+            reject(error);
+          }
+        );
+      } catch (err) {
+        reject(err);
+        console.error(err);
+      }
+    });
+  };
+
+  return { loadCharacter };
+};
+
+export default setCharacter;
+
+async function generateAESKey(password: string): Promise<CryptoKey> {
+  const passwordBuffer = new TextEncoder().encode(password);
+  const hashedPassword = await crypto.subtle.digest("SHA-256", passwordBuffer);
+  return crypto.subtle.importKey(
+    "raw",
+    hashedPassword.slice(0, 32),
+    { name: "AES-CBC" },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+export const decryptFile = async (
+  url: string,
+  password: string
+): Promise<ArrayBuffer> => {
+  const response = await fetch(url);
+  const encryptedData = await response.arrayBuffer();
+  const iv = new Uint8Array(encryptedData.slice(0, 16));
+  const data = encryptedData.slice(16);
+  const key = await generateAESKey(password);
+  return crypto.subtle.decrypt({ name: "AES-CBC", iv }, key, data);
+};
+
+import * as THREE from "three";
+import { RGBELoader } from "three-stdlib";
+import { gsap } from "gsap";
+
+const setLighting = (scene: THREE.Scene) => {
+  const directionalLight = new THREE.DirectionalLight(0xc7a9ff, 0);
+  directionalLight.intensity = 0;
+  directionalLight.position.set(-0.47, -0.32, -1);
+  directionalLight.castShadow = true;
+  directionalLight.shadow.mapSize.width = 1024;
+  directionalLight.shadow.mapSize.height = 1024;
+  directionalLight.shadow.camera.near = 0.5;
+  directionalLight.shadow.camera.far = 50;
+  scene.add(directionalLight);
+
+  const pointLight = new THREE.PointLight(0xc2a4ff, 0, 100, 3);
+  pointLight.position.set(3, 12, 4);
+  pointLight.castShadow = true;
+  scene.add(pointLight);
+
+  new RGBELoader()
+    .setPath("/models/")
+    .load("char_enviorment.hdr", function (texture) {
+      texture.mapping = THREE.EquirectangularReflectionMapping;
+      scene.environment = texture;
+      scene.environmentIntensity = 0;
+      scene.environmentRotation.set(5.76, 85.85, 1);
+    });
+
+  function setPointLight(screenLight: any) {
+    if (screenLight.material.opacity > 0.9) {
+      pointLight.intensity = screenLight.material.emissiveIntensity * 20;
+    } else {
+      pointLight.intensity = 0;
+    }
+  }
+  const duration = 2;
+  const ease = "power2.inOut";
+  function turnOnLights() {
+    gsap.to(scene, {
+      environmentIntensity: 0.64,
+      duration: duration,
+      ease: ease,
+    });
+    gsap.to(directionalLight, {
+      intensity: 1,
+      duration: duration,
+      ease: ease,
+    });
+    gsap.to(".character-rim", {
+      y: "55%",
+      opacity: 1,
+      delay: 0.2,
+      duration: 2,
+    });
+  }
+
+  return { setPointLight, turnOnLights };
+};
+
+export default setLighting;
+
+import * as THREE from "three";
+
+export const handleMouseMove = (
+  event: MouseEvent,
+  setMousePosition: (x: number, y: number) => void
+) => {
+  const mouseX = (event.clientX / window.innerWidth) * 2 - 1;
+  const mouseY = -(event.clientY / window.innerHeight) * 2 + 1;
+  setMousePosition(mouseX, mouseY);
+};
+
+export const handleTouchMove = (
+  event: TouchEvent,
+  setMousePosition: (x: number, y: number) => void
+) => {
+  const mouseX = (event.touches[0].clientX / window.innerWidth) * 2 - 1;
+  const mouseY = -(event.touches[0].clientY / window.innerHeight) * 2 + 1;
+  setMousePosition(mouseX, mouseY);
+};
+
+export const handleTouchEnd = (
+  setMousePosition: (
+    x: number,
+    y: number,
+    interpolationX: number,
+    interpolationY: number
+  ) => void
+) => {
+  setTimeout(() => {
+    setMousePosition(0, 0, 0.03, 0.03);
+    setTimeout(() => {
+      setMousePosition(0, 0, 0.1, 0.2);
+    }, 1000);
+  }, 2000);
+};
+
+export const handleHeadRotation = (
+  headBone: THREE.Object3D,
+  mouseX: number,
+  mouseY: number,
+  interpolationX: number,
+  interpolationY: number,
+  lerp: (x: number, y: number, t: number) => number
+) => {
+  if (!headBone) return;
+  if (window.scrollY < 200) {
+    const maxRotation = Math.PI / 6;
+    headBone.rotation.y = lerp(
+      headBone.rotation.y,
+      mouseX * maxRotation,
+      interpolationY
+    );
+    let minRotationX = -0.3;
+    let maxRotationX = 0.4;
+    if (mouseY > minRotationX) {
+      if (mouseY < maxRotationX) {
+        headBone.rotation.x = lerp(
+          headBone.rotation.x,
+          -mouseY - 0.5 * maxRotation,
+          interpolationX
+        );
+      } else {
+        headBone.rotation.x = lerp(
+          headBone.rotation.x,
+          -maxRotation - 0.5 * maxRotation,
+          interpolationX
+        );
+      }
+    } else {
+      headBone.rotation.x = lerp(
+        headBone.rotation.x,
+        -minRotationX - 0.5 * maxRotation,
+        interpolationX
+      );
+    }
+  } else {
+    if (window.innerWidth > 1024) {
+      headBone.rotation.x = lerp(headBone.rotation.x, -0.4, 0.03);
+      headBone.rotation.y = lerp(headBone.rotation.y, -0.3, 0.03);
+    }
+  }
+};
+
+import * as THREE from "three";
+import { ScrollTrigger } from "gsap/ScrollTrigger";
+import { setCharTimeline, setAllTimeline } from "../../utils/GsapScroll";
+
+export default function handleResize(
+  renderer: THREE.WebGLRenderer,
+  camera: THREE.PerspectiveCamera,
+  canvasDiv: React.RefObject<HTMLDivElement>,
+  character: THREE.Object3D
+) {
+  if (!canvasDiv.current) return;
+  let canvas3d = canvasDiv.current.getBoundingClientRect();
+  const width = canvas3d.width;
+  const height = canvas3d.height;
+  renderer.setSize(width, height);
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+  const workTrigger = ScrollTrigger.getById("work");
+  ScrollTrigger.getAll().forEach((trigger) => {
+    if (trigger != workTrigger) {
+      trigger.kill();
+    }
+  });
+  setCharTimeline(character, camera);
+  setAllTimeline();
+}
